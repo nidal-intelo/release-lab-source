@@ -1,0 +1,47 @@
+version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[manifest]
+members = [
+    "qb",
+    "report",
+    "solver",
+    "worker",
+]
+
+[[package]]
+name = "qb"
+version = "0.0.0"
+source = { editable = "common/qb" }
+
+[[package]]
+name = "report"
+version = "0.0.0"
+source = { editable = "consumers/report" }
+dependencies = [
+    { name = "qb" },
+    { name = "solver" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "qb", editable = "common/qb" },
+    { name = "solver", editable = "common/solver" },
+]
+
+[[package]]
+name = "solver"
+version = "0.0.0"
+source = { editable = "common/solver" }
+
+[[package]]
+name = "worker"
+version = "0.0.0"
+source = { editable = "consumers/worker" }
+dependencies = [
+    { name = "qb" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "qb", editable = "common/qb" }]

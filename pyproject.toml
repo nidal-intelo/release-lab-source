@@ -1,0 +1,13 @@
+# Virtual workspace root -- not a package itself.
+# Everything below is built FROM SOURCE at whatever commit is checked out.
+[tool.uv.workspace]
+members = [
+    "common/qb",
+    "common/solver",
+    "consumers/report",
+    "consumers/worker",
+]
+
+[tool.uv.sources]
+qb = { workspace = true }
+solver = { workspace = true }
