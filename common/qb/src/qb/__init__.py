@@ -1,7 +1,7 @@
 """qb -- stand-in for query-builder."""
 
-ERA = "1.4-era"
-ROUNDING = "rounds DOWN, validated inputs"
+ERA = "1.5-era"
+ROUNDING = "rounds HALF-EVEN (banker's rounding)"
 
 CART_NOTE = "BUG: off-by-one on empty carts"
 
