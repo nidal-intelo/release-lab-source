@@ -4,4 +4,4 @@ import qb
 
 
 def main() -> str:
-    return qb.describe()
+    return f"WORKER: {qb.describe()}"
