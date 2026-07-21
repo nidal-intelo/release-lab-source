@@ -1,0 +1,114 @@
+# hotfix — the emergency lane. Dispatch with the dev PR number(s) carrying
+# the fix; this workflow:
+#
+#   1. cuts hotfix/pr-<n> from PRODUCTION's CURRENT TIP (not from dev — the
+#      fix must land on what production actually runs, without dragging along
+#      everything else dev has accumulated),
+#   2. cherry-picks the fix PR(s) onto it, stamped, using the same engine as
+#      the release trains (scripts/cut-train.sh — same resolution rules, same
+#      dependency detector on conflict),
+#   3. opens TWIN PRs from that one branch:
+#        -> uat          "hotfix: …"                      merge this one FIRST
+#        -> production   "[merge after uat] hotfix: …"    red until uat merges
+#
+# The ordering is not a convention you have to remember: the gate's
+# "yellow train first" rule keeps the production twin red until each pick's
+# origin is on uat. Merge uat, the gate re-run turns green, merge production.
+# Deploy then tags production rel-YYYY.MM.DD-hfN.
+#
+# PROTOTYPES (real repo): v1-hotfix-create.yaml.
+#
+# Note fix-forward discipline: the fix lands on dev FIRST (a normal dev PR),
+# then rides this lane down. There is no "fix production directly" — that is
+# how environments drift apart for good.
+name: hotfix
+
+on:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: "dev PR number(s) carrying the fix, comma-separated"
+        type: string
+        required: true
+
+permissions:
+  contents: write            # push the hotfix branch
+  pull-requests: write       # open the twin PRs
+
+env:
+  # Same token teachable as promote.yaml: with no LAB_BOT_PAT, the twins are
+  # created by github.token and fire no checks (see promote.yaml's header).
+  GH_TOKEN: ${{ secrets.LAB_BOT_PAT || github.token }}
+
+jobs:
+  hotfix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: git identity (cherry-picks need a committer)
+        run: |
+          git config user.name "Release Lab"
+          git config user.email "lab@local"
+
+      - name: cut the hotfix branch from production's tip
+        run: |
+          set -euo pipefail
+          PRS="${{ inputs.prs }}"
+          BRANCH="hotfix/pr-$(tr -d ' ' <<<"$PRS" | tr ',' '-')"
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            BRANCH="$BRANCH-$GITHUB_RUN_NUMBER"
+          fi
+
+          # same engine as the release trains — a hotfix IS a tiny train,
+          # just cut from production instead of the next env down the lane
+          PICKS_OUT=picks.tsv scripts/cut-train.sh production "$BRANCH" "$PRS"
+          git push -q origin "$BRANCH"
+          echo "BRANCH=$BRANCH" >>"$GITHUB_ENV"
+
+      - name: open the twin PRs
+        run: |
+          set -euo pipefail
+          # if PR creation is blocked (Actions PR-creation setting off, no
+          # LAB_BOT_PAT), the branch is already pushed — say so and stop
+          trap '{ echo "## twins NOT (fully) created — branch \`$BRANCH\` is pushed with the picks aboard.";
+                  echo "Open them by hand (\`gh pr create --base uat|production --head $BRANCH\`) or fix the";
+                  echo "Actions PR-creation setting / add \`LAB_BOT_PAT\` and re-dispatch (see promote.yaml header)."; } >>"$GITHUB_STEP_SUMMARY"' ERR
+          FIRST_TITLE="$(head -1 picks.tsv | cut -f2)"
+          NPICKS="$(wc -l <picks.tsv | tr -d ' ')"
+          SUFFIX=""; [ "$NPICKS" -gt 1 ] && SUFFIX=" (+$((NPICKS-1)) more)"
+
+          {
+            echo "Hotfix cut from \`production\` @ \`$(git rev-parse --short origin/production)\`. Picks:"
+            echo ""
+            echo "| PR | title | author | picked merge SHA |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r NUM TITLE AUTHOR SHA; do
+              echo "| #$NUM | $TITLE | $AUTHOR | \`${SHA:0:7}\` |"
+            done <picks.tsv
+            echo ""
+          } >body-common.md
+
+          # twin 1: uat — the yellow train. Merge this one first.
+          { cat body-common.md
+            echo "**This is the uat twin — merge it FIRST.** Its production sibling stays red at the gate until these picks are on uat."
+          } >body-uat.md
+          U1=$(gh pr create --base uat --head "$BRANCH" \
+                 --title "hotfix: $FIRST_TITLE$SUFFIX" \
+                 --body-file body-uat.md)
+
+          # twin 2: production — gated on the uat twin having merged.
+          { cat body-common.md
+            echo "**This is the production twin.** The gate holds it red until every pick's origin is on uat (merge the uat twin, then re-run/wait for the gate here)."
+          } >body-prod.md
+          U2=$(gh pr create --base production --head "$BRANCH" \
+                 --title "[merge after uat] hotfix: $FIRST_TITLE$SUFFIX" \
+                 --body-file body-prod.md)
+
+          {
+            echo "## hotfix twins opened"
+            echo "- uat (merge first): $U1"
+            echo "- production (gate-held): $U2"
+          } >>"$GITHUB_STEP_SUMMARY"
