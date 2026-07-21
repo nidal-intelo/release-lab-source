@@ -185,7 +185,9 @@ jobs:
             fi
             echo ""
             if [ "$ENV" = uat ]; then
-              echo "Your change is **on UAT now** — test yours and nominate it for PROD if good."
+              # prod is wholesale-only: there is no "nominate mine" — the whole
+              # uat state ships together, so the ask is validate-or-pull-back.
+              echo "Your change is **on UAT now** — test yours; anything broken gets fixed or reverted via the next yellow train, before the prod release."
             else
               echo "Shipped. :ship:"
               # Release notes: everything since the previous rel-* tag.
