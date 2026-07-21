@@ -4,25 +4,31 @@
 #
 # Three rules, in order:
 #
-#   1. ALLOWED LANES. uat and production accept PRs only from:
-#        dev        -> uat          (Mode A wholesale)
-#        uat        -> production   (Mode A wholesale)
+#   1. ALLOWED LANES.
+#      uat accepts PRs only from:
+#        dev                        (Mode A wholesale)
 #        train/*                    (Mode B release trains)
-#        hotfix/*                   (hotfix twins)
+#        hotfix/*                   (hotfix twins, riding uat first)
 #        bot/*                      (reserved for automation)
-#      Anything else — e.g. a feature branch aimed straight at production —
-#      is refused: work lands on dev, releases ride the lanes.
+#      production accepts PRs ONLY from:
+#        uat                        (Mode A wholesale)
+#        hotfix/*                   (the one emergency exception)
+#      NO trains into production: uat validates a WHOLE state; a subset
+#      picked at the prod step would ship a combination uat never ran.
+#      Selectivity lives at dev->uat only. Anything else — a feature branch
+#      aimed straight at production, a train/* aimed past uat — is refused:
+#      work lands on dev, releases ride the lanes.
 #
 #   2. STAMPS (train/* and hotfix/* heads only). Every added non-merge commit
 #      must carry a "(cherry picked from commit <sha>)" stamp whose origin is
 #      reachable from dev. A hand-edited commit smuggled onto a train has no
 #      stamp -> named and refused. Provenance or it didn't happen.
 #
-#   3. YELLOW TRAIN FIRST (train/hotfix PRs into production only). Every
-#      pick's ORIGIN must already be on uat — either merged wholesale
-#      (reachable) or cherry-picked there (a uat commit carries its stamp).
-#      This is what makes hotfix twin-PR ordering mechanical: the production
-#      twin is simply red until the uat twin merges.
+#   3. YELLOW TRAIN FIRST (hotfix/* PRs into production). Every pick's ORIGIN
+#      must already be on uat — either merged wholesale (reachable) or
+#      cherry-picked there (a uat commit carries its stamp). This is what
+#      makes hotfix twin-PR ordering mechanical: the production twin is
+#      simply red until the uat twin merges.
 #
 # The branch rulesets (scripts/setup-protection.sh) REQUIRE this check by its
 # job name, "gate" — that is what turns a red gate into "cannot merge".
@@ -63,12 +69,21 @@ jobs:
 
           # ---- rule 1: allowed lanes -----------------------------------
           MODE=""
-          if   [ "$BASE" = uat ]        && [ "$HEAD_REF" = dev ]; then MODE=wholesale
-          elif [ "$BASE" = production ] && [ "$HEAD_REF" = uat ]; then MODE=wholesale
-          elif [[ "$HEAD_REF" == train/* || "$HEAD_REF" == hotfix/* ]]; then MODE=train
-          elif [[ "$HEAD_REF" == bot/* ]]; then MODE=bot
-          else
-            fail "\`$HEAD_REF\` → \`$BASE\` is not a release lane. Work lands on **dev** (open PRs there); releases reach \`$BASE\` only as \`dev→uat\`, \`uat→production\`, \`train/*\`, \`hotfix/*\`, or \`bot/*\`."
+          if [ "$BASE" = uat ]; then
+            if   [ "$HEAD_REF" = dev ]; then MODE=wholesale
+            elif [[ "$HEAD_REF" == train/* || "$HEAD_REF" == hotfix/* ]]; then MODE=train
+            elif [[ "$HEAD_REF" == bot/* ]]; then MODE=bot
+            else
+              fail "\`$HEAD_REF\` → \`uat\` is not a release lane. Work lands on **dev** (open PRs there); releases reach \`uat\` only as \`dev→uat\`, \`train/*\`, \`hotfix/*\`, or \`bot/*\`."
+            fi
+          else  # production: WHOLESALE-ONLY (+ the hotfix exception).
+            # uat validated a whole state — a subset picked here would ship a
+            # combination uat never ran. Selectivity lives at dev->uat only.
+            if   [ "$HEAD_REF" = uat ]; then MODE=wholesale
+            elif [[ "$HEAD_REF" == hotfix/* ]]; then MODE=train
+            else
+              fail "\`$HEAD_REF\` → \`production\` is not a release lane. **Production releases are wholesale** (\`uat→production\`) — selectivity happens at dev→uat; for emergencies use the \`hotfix/*\` lane. Trains (\`train/*\`) do not run past uat."
+            fi
           fi
 
           # ---- rules 2 + 3: stamp provenance ---------------------------

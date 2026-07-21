@@ -4,17 +4,18 @@
 #   MODE A (prs empty): WHOLESALE — open a promotion PR merging the whole
 #     source branch (dev->uat, or uat->production). Everything goes.
 #
-#   MODE B (prs given): RELEASE TRAIN — cherry-pick exactly those PRs' merge
-#     commits (stamped, in dev-merge order) onto a train/<target>-<date>
-#     branch cut from the TARGET's current tip, and open a train PR whose
-#     body ECHOES BACK precisely what boarded. Merging the PR is the release.
+#   MODE B (prs given, target=uat ONLY): RELEASE TRAIN — cherry-pick exactly
+#     those PRs' merge commits (stamped, in dev-merge order) onto a
+#     train/uat-<date> branch cut from uat's current tip, and open a train PR
+#     whose body ECHOES BACK precisely what boarded. Merging the PR is the
+#     release.
 #
 # PROTOTYPES (real repo): the dispatch side of v1-promotion-gate.yaml.
 #
-# Note on Mode B to production: picks still come from dev (that is where work
-# lands), but the gate will refuse any pick that has not already ridden a uat
-# release — "yellow train first". promote does not pre-check that; the gate
-# owns that rule in exactly one place.
+# PRODUCTION IS WHOLESALE-ONLY. uat validates a whole state; cherry-picking a
+# subset at the prod step would ship a combination uat never ran. Selectivity
+# lives at dev->uat only. The single exception lane into production is
+# hotfix/* (hotfix.yaml), and even that must ride uat first (gate rule 3).
 name: promote
 
 on:
@@ -58,6 +59,24 @@ jobs:
           git config user.name "Release Lab"
           git config user.email "lab@local"
 
+      # No trains into production — see the header. Refuse before cutting anything.
+      - name: "refuse: production releases are wholesale"
+        if: inputs.target == 'production' && inputs.prs != ''
+        run: |
+          set -euo pipefail
+          {
+            echo "## refused: production releases are wholesale"
+            echo ""
+            echo "You dispatched a release train (\`prs=${{ inputs.prs }}\`) at \`production\`."
+            echo "**Production releases are wholesale** — uat validated a *whole state*, and a"
+            echo "subset picked at the prod step would ship a combination uat never ran."
+            echo ""
+            echo "* selectivity happens at **dev → uat**: \`gh workflow run promote.yaml -f target=uat -f prs=…\`"
+            echo "* then release the validated state: \`gh workflow run promote.yaml -f target=production\`"
+            echo "* for emergencies use the **hotfix** workflow (the only pick lane into production)"
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit 1
+
       - name: "mode A: wholesale promotion PR"
         if: inputs.prs == ''
         run: |
@@ -70,6 +89,26 @@ jobs:
             echo "Wholesale promotion: merging this PR makes \`$TARGET\` identical to \`$SOURCE\` (source-world: the branch IS the deploy)."
             echo ""
             echo "The **gate** check validates the lane; **deploy** runs on merge and posts the Slack preview here."
+            if [ "$TARGET" = production ]; then
+              # ECHO what's riding: dev PRs already on uat but not yet on
+              # production (pending-on-production minus pending-on-uat).
+              scripts/pending.sh 0 production >notprod.tsv
+              scripts/pending.sh 0 uat        >notuat.tsv
+              echo ""
+              echo "**Riding this release** (validated on uat, not yet on production):"
+              echo ""
+              RIDING=0
+              while IFS=$'\t' read -r NUM TITLE AUTHOR MERGED AGE; do
+                # skip PRs that aren't on uat yet — a wholesale ships uat's
+                # state, so anything still waiting on dev is not in this shipment
+                if cut -f1 notuat.tsv | grep -qx "$NUM"; then continue; fi
+                RIDING=$((RIDING+1))
+                echo "- #$NUM — $TITLE (@$AUTHOR)"
+              done <notprod.tsv
+              if [ "$RIDING" = 0 ]; then
+                echo "- _(no PR-tracked changes — uat and production already match, or the delta is untracked commits)_"
+              fi
+            fi
           } >body.md
 
           if URL=$(gh pr create --base "$TARGET" --head "$SOURCE" \
