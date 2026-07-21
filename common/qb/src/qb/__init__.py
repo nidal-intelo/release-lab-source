@@ -3,7 +3,7 @@
 ERA = "1.3-era"
 ROUNDING = "rounds DOWN"
 
-CART_NOTE = "BUG: off-by-one on empty carts"
+CART_NOTE = "empty carts handled correctly"
 
 
 def describe() -> str:
