@@ -66,13 +66,15 @@ jobs:
           # the lane below the target: dev feeds uat, uat feeds production
           SOURCE=$([ "$TARGET" = uat ] && echo dev || echo uat)
 
-          BODY="Wholesale promotion: merging this PR makes \`$TARGET\` identical to \`$SOURCE\` (source-world: the branch IS the deploy).
-
-The **gate** check validates the lane; **deploy** runs on merge and posts the Slack preview here."
+          {
+            echo "Wholesale promotion: merging this PR makes \`$TARGET\` identical to \`$SOURCE\` (source-world: the branch IS the deploy)."
+            echo ""
+            echo "The **gate** check validates the lane; **deploy** runs on merge and posts the Slack preview here."
+          } >body.md
 
           if URL=$(gh pr create --base "$TARGET" --head "$SOURCE" \
                      --title "promote: $SOURCE → $TARGET (wholesale)" \
-                     --body "$BODY" 2>&1); then
+                     --body-file body.md 2>&1); then
             echo "opened: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             # Two known ways this fails — both are lessons, not mysteries:
