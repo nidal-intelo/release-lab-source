@@ -76,6 +76,18 @@ Plus three shared scripts: `scripts/cut-train.sh` (the train engine),
   normal yellow train, #17, and the production twin #16 proceeded); #18/#19 =
   gate probes for the wholesale-only rule.
 
+> **Known wrinkle (seed-lineage add/add).** The CI files reached uat and
+> production as *cherry-picks* of dev commits, so each branch added them with
+> its own SHAs — the branches' merge-base predates the files entirely. Every
+> wholesale promotion therefore re-merges them as add/add: silent while the
+> copies are content-identical, a **conflict** the moment any copy drifts
+> (that bit PR #27 in `scripts/cut-train.sh`, repaired by hotfix #28; same
+> family as twin #15). The one-liner lesson: **cherry-picking the same change
+> onto both sides of a fence splits its file history — picks copy content,
+> only merges join lineage.** The first wholesale merge across the fence
+> heals it for good. The real repo doesn't have this class of problem: its
+> workflow files flow between branches via merges from the start.
+
 ---
 
 ## Exercise 3.0 — Tour the six pieces
