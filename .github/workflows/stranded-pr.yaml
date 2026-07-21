@@ -1,0 +1,90 @@
+# stranded-pr — the visibility bot. "Merged to dev" feels like "shipped";
+# it is not — it is "boarded nothing yet". This workflow keeps exactly ONE
+# issue alive listing every dev PR that has waited too long for a uat
+# release, assigns it to the PR authors, and closes itself when the platform
+# is clean. Deploys to uat print the same list as a footer (same script:
+# scripts/pending.sh — one reachability check, two consumers).
+#
+# PROTOTYPES (real repo): the notify-slack / release-dashboard visibility
+# layer — the part of release engineering that is pure "who needs to know".
+name: stranded-pr
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"       # every 6h (offset minute: kinder to the cron fleet)
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "flag PRs merged to dev at least this many hours ago (0 = flag everything unreleased)"
+        type: string
+        default: "48"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: stranded-pr
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: audit dev vs uat
+        run: |
+          set -euo pipefail
+          MAX="${{ inputs.max_age_hours || '48' }}"    # schedule runs use 48
+          TITLE="Stranded on dev: PRs awaiting a uat release"
+
+          scripts/pending.sh "$MAX" >stranded.tsv
+
+          EXISTING="$(gh issue list --state open --limit 100 --json number,title \
+                      | jq -r --arg t "$TITLE" '[.[]|select(.title==$t)][0].number // empty')"
+
+          if [ -s stranded.tsv ]; then
+            {
+              echo "These PRs are merged to \`dev\` but have not ridden any uat release"
+              echo "(neither a wholesale promotion nor a train pick) for over ${MAX}h:"
+              echo ""
+              echo "| PR | title | author | merged | age (h) |"
+              echo "|---|---|---|---|---|"
+              while IFS=$'\t' read -r NUM T AUTHOR MERGED AGE; do
+                echo "| #$NUM | $T | $AUTHOR | $MERGED | $AGE |"
+              done <stranded.tsv
+              echo ""
+              echo "Catch a train: \`gh workflow run promote.yaml -f target=uat -f prs=<numbers>\`"
+              echo "or promote wholesale: \`gh workflow run promote.yaml -f target=uat\`."
+              echo ""
+              echo "_Maintained by stranded-pr.yaml — it updates this issue and closes it when nothing is stranded._"
+            } >body.md
+
+            if [ -n "$EXISTING" ]; then
+              gh issue edit "$EXISTING" --body-file body.md >/dev/null
+              NUM="$EXISTING"
+            else
+              NUM="$(gh issue create --title "$TITLE" --body-file body.md | grep -oE '[0-9]+$')"
+            fi
+            # nag the right people: the PR authors own their stranded work
+            # (in this sandbox every author is the repo owner — that's fine)
+            ASSIGNEES="$(cut -f3 stranded.tsv | sort -u | paste -sd, -)"
+            gh issue edit "$NUM" --add-assignee "$ASSIGNEES" >/dev/null || true
+
+            { echo "## stranded: $(wc -l <stranded.tsv | tr -d ' ') PR(s) — issue #$NUM"
+              cat body.md; } >>"$GITHUB_STEP_SUMMARY"
+          else
+            if [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" \
+                --comment "Nothing stranded — everything merged to dev has ridden a uat release. Auto-closing." >/dev/null
+              echo "## clean — closed issue #$EXISTING" >>"$GITHUB_STEP_SUMMARY"
+            else
+              echo "## clean — nothing stranded, no issue to manage" >>"$GITHUB_STEP_SUMMARY"
+            fi
+          fi
