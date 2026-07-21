@@ -12,7 +12,7 @@ is six small pieces around that single idea:
 | piece | file | job | real-repo file it prototypes |
 |---|---|---|---|
 | deploy | `.github/workflows/deploy.yaml` | deploy on env-branch push; rc-/rel- tags; release notes; Slack preview | the `v1-*` deployment workflows + notify-slack |
-| promote | `.github/workflows/promote.yaml` | the release button: wholesale PR (Mode A) or cherry-picked train (Mode B) | dispatch side of `v1-promotion-gate.yaml` |
+| promote | `.github/workflows/promote.yaml` | the release button: wholesale PR (Mode A) or cherry-picked train (Mode B — dev→uat only) | dispatch side of `v1-promotion-gate.yaml` |
 | gate | `.github/workflows/gate.yaml` | the one required check: lanes, stamps, uat-first | `v1-promotion-gate.yaml` |
 | hotfix | `.github/workflows/hotfix.yaml` | stamped fix off production's tip, twin PRs | `v1-hotfix-create.yaml` |
 | stranded-pr | `.github/workflows/stranded-pr.yaml` | the nagging issue: merged to dev ≠ released | the visibility / notify layer |
@@ -31,6 +31,11 @@ Plus three shared scripts: `scripts/cut-train.sh` (the train engine),
 - Merges into `uat`/`production` are **merge commits only** (the ruleset
   enforces it). This CI decides "was PR X released?" by commit ancestry and
   cherry-pick stamps; a squash would erase both.
+- **Production is wholesale-only.** uat validates a *whole state*; picking a
+  subset at the prod step would ship a combination uat never ran. Trains run
+  dev→uat only; `hotfix/*` is the single exception lane into production (and
+  even it must ride uat first). promote refuses `target=production` with
+  `prs`; the gate refuses `train/*` aimed at production.
 - Watching runs: `gh run list --limit 5`, `gh run watch`, and — every time —
   the run's **summary** (`gh run view --web`). The summaries are the deploy
   log, the Slack preview, and the release notes of this world.
@@ -55,16 +60,21 @@ Plus three shared scripts: `scripts/cut-train.sh` (the train engine),
 - `dev`: 1.5-era qb **plus** merged PRs #2 (qb audit log), #3 (solver
   jitter), #4 (report v2 header), #8 (qb epsilon guard), #9 (**the empty-cart
   fix!**), #12 (worker prefix).
-- `uat`: has ridden two wholesales (#1, #7) and two trains (#5 → PRs 2+3,
-  #13 → PR 12). **#8 and #9 are NOT on uat** — they are your 3.1 cargo.
+- `uat`: has ridden two wholesales (#1, #7) and three trains (#5 → PRs 2+3,
+  #13 → PR 12, #17 → PR 14). **#8 and #9 are NOT on uat** — they are your
+  3.1 cargo.
 - `production`: still 1.3-era qb + the CI files (which arrived as stamped
-  cherry-picks — `git log origin/production --oneline` and look). The cart
-  bug still lives there.
+  cherry-picks — `git log origin/production --oneline` and look) + one real
+  hotfix: the wholesale-only CI policy itself rode the emergency lane down
+  (PR #16, tag `rel-2026.07.21-hf1`). The cart bug still lives there.
 - Tags: `rc-*`/`rel-*` from the shakedown; floating `lab-<branch>-latest` per
   branch. (Ignore the stray `rel-hf1` — an Act-1-era leftover on an orphaned
   commit; the release-notes logic ignores it too.)
-- Issue #6 (stranded) exists, closed. Closed twin PRs #10/#11 are a preview
-  of 3.5.
+- Issue #6 (stranded) exists, closed. Closed PRs are previews: #10/#11 = the
+  3.5 drill; #15 = a hotfix twin that *conflicted* at uat (its fix touched CI
+  files whose uat/production copies diverged — off-ramp: the fix rode a
+  normal yellow train, #17, and the production twin #16 proceeded); #18/#19 =
+  gate probes for the wholesale-only rule.
 
 ---
 
@@ -124,9 +134,9 @@ bot's) kicks the event; the real fix is 3.4.
 **redeployed** (common/ changed), behavior strings now carrying `+ audit log
 [epsilon 1e-9]` and `empty carts handled correctly` on uat; a new
 `rc-YYYY.MM.DD-n` tag; a **SLACK PREVIEW** section listing #8 and #9 with
-`<@author>` pings and "test yours and nominate for PROD if good"; the same
-message posted as a comment on your promotion PR; and the footer —
-**NOT on uat yet: nothing**.
+`<@author>` pings and "test yours; anything broken gets fixed or reverted via
+the next yellow train, before the prod release"; the same message posted as a
+comment on your promotion PR; and the footer — **NOT on uat yet: nothing**.
 
 **What just happened:** a release was: merge one PR. The Slack table wasn't
 typed by anyone — `scripts/boarded.sh` read it out of the commit range
@@ -185,9 +195,10 @@ run for PR #8 in the Actions history).
 
 ---
 
-## Exercise 3.3 — Self-heal: the wholesale sweep
+## Exercise 3.3 — Self-heal: the wholesale sweep (and the refusal)
 
-**Goal:** watch the stranded issue close itself.
+**Goal:** watch the stranded issue close itself — then try to be selective at
+the prod step and read the machine's answer.
 
 **Commands:**
 
@@ -203,9 +214,34 @@ gh issue list --state all | head -3                 # closed, with a comment
 *ancestor* of uat; the next audit found nothing stranded and closed the issue
 with "Nothing stranded — … Auto-closing."
 
+**Now the refusal** — uat looks good, so try to take just your favorite PR to
+production:
+
+```sh
+gh workflow run promote.yaml -f target=production -f prs=<a>
+gh run watch                     # fails immediately; READ THE SUMMARY:
+                                 # "refused: production releases are wholesale —
+                                 #  selectivity happens at dev→uat; for emergencies
+                                 #  use the hotfix workflow"
+gh workflow run promote.yaml -f target=production   # the correct button (Mode A)
+gh pr view <promo-pr>            # body ECHOES what's riding: every dev PR on uat
+                                 # not yet on production — merge it if you mean it
+```
+
+(The gate enforces the same law from the other side: a `train/*` branch aimed
+at production is refused *by lane*, stamps or no stamps — the shakedown's
+probe PR #18 shows the exact message.)
+
+> **Principle: uat is a queue, not a parking lot.** Boarding a yellow train
+> = committed to prod; the next wholesale ships *everything* uat has. The
+> off-ramps are fix-forward or revert — both via dev, both riding the same
+> trains. There is no "leave it on uat and ship around it."
+
 **What just happened:** the audit is stateless — it recomputes reality from
 git every run, so it heals no matter *how* the PR got released (train stamp
-or wholesale ancestry). Nobody updates a spreadsheet.
+or wholesale ancestry). Nobody updates a spreadsheet. And production
+promotions carry no `prs` knob: uat validated a whole state, so a subset
+picked at the prod step would ship a combination uat never ran.
 
 ---
 
@@ -303,6 +339,13 @@ hand-edit a file on the hotfix branch, commit without `-x`, push. The gate
 names your commit: **UNSTAMPED … Hand edits don't ride trains.** (The
 shakedown's PRs #10/#11 show exactly this — read their comment threads.)
 
+One edge worth knowing: if the uat twin shows **conflicts** (it can, when the
+fix touches files whose uat and production copies have diverged histories),
+close it and ride a normal yellow train to uat instead
+(`promote target=uat prs=<fix-pr>`) — the production twin doesn't care *how*
+its picks got to uat, only that they did. The shakedown's #15→#17→#16 chain
+is a worked example.
+
 **What you should observe:** production got ONE change (check its deploy
 summary: qb redeployed, behavior shows your fix on top of 1.3-era strings —
 dev's other work did NOT come along); the release notes on the prod deploy
@@ -357,7 +400,7 @@ landed and released to uat:
 | "what runs in prod?" | manifest.json + pins archaeology | `git log production` — the branch is the answer |
 | ship qb to ONE consumer only | yes — pin just that consumer | **no** — common/ change redeploys every consumer on the branch |
 | hotfix artifact left behind | `release/qb-1.3.0` branch shelf, forever | a deleted `hotfix/pr-N` branch and a `rel-*-hfN` tag |
-| partial release | choose pins | choose train picks (dependency detector watching) |
+| partial release | choose pins, per env | choose train picks (dependency detector watching) — **to uat only**; production takes uat whole |
 | failure mode to fear | forgotten repin / stale pin (drift alarm exists *because* of it) | conflicted pick = hidden dependency (detector names it); squash-merge erasing stamps (ruleset forbids it) |
 
 Count what each column asks a human to *remember* versus *decide*. The pinned
