@@ -1,19 +1,28 @@
 # hotfix — the emergency lane. Dispatch with the dev PR number(s) carrying
 # the fix; this workflow:
 #
-#   1. cuts hotfix/pr-<n> from PRODUCTION's CURRENT TIP (not from dev — the
-#      fix must land on what production actually runs, without dragging along
-#      everything else dev has accumulated),
+#   1. cuts hotfix/pr-<n>-uat from PRODUCTION's CURRENT TIP (not from dev —
+#      the fix must land on what production actually runs, without dragging
+#      along everything else dev has accumulated),
 #   2. cherry-picks the fix PR(s) onto it, stamped, using the same engine as
 #      the release trains (scripts/cut-train.sh — same resolution rules, same
 #      dependency detector on conflict),
-#   3. opens TWIN PRs from that one branch:
-#        -> uat          "hotfix: …"                      merge this one FIRST
-#        -> production   "[merge after uat] hotfix: …"    red until uat merges
+#   3. re-tips an IDENTICAL-CONTENT sibling branch hotfix/pr-<n>-prod
+#      (distinct SHA — see WHY TWO BRANCHES below), then opens the twins:
+#        hotfix/pr-<n>-uat  -> uat         "hotfix: …"            merge FIRST
+#        hotfix/pr-<n>-prod -> production  "[merge after uat] …"  red until uat merges
+#
+# WHY TWO BRANCHES: branch-protection required checks are keyed by
+# (commit SHA, check name). If both twins share one head commit, there is a
+# single "gate" slot for that commit — one verdict for two PRs. The gate
+# correctly fails the production twin (picks not on uat yet), and that same
+# red verdict then wrongly blocks the uat twin too. Distinct tip SHAs give
+# each twin its own independent gate verdict. (The real v1-hotfix-create.yaml
+# must open its twins on separate branches for exactly this reason.)
 #
 # The ordering is not a convention you have to remember: the gate's
 # "yellow train first" rule keeps the production twin red until each pick's
-# origin is on uat. Merge uat, the gate re-run turns green, merge production.
+# origin is on uat. Merge uat, re-run the production twin's gate, merge it.
 # Deploy then tags production rel-YYYY.MM.DD-hfN.
 #
 # PROTOTYPES (real repo): v1-hotfix-create.yaml.
@@ -53,29 +62,41 @@ jobs:
           git config user.name "Release Lab"
           git config user.email "lab@local"
 
-      - name: cut the hotfix branch from production's tip
+      - name: cut the twin hotfix branches from production's tip
         run: |
           set -euo pipefail
           PRS="${{ inputs.prs }}"
-          BRANCH="hotfix/pr-$(tr -d ' ' <<<"$PRS" | tr ',' '-')"
-          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
-            BRANCH="$BRANCH-$GITHUB_RUN_NUMBER"
+          BASE="hotfix/pr-$(tr -d ' ' <<<"$PRS" | tr ',' '-')"
+          if git ls-remote --exit-code origin "refs/heads/$BASE-uat"  >/dev/null 2>&1 \
+          || git ls-remote --exit-code origin "refs/heads/$BASE-prod" >/dev/null 2>&1; then
+            BASE="$BASE-$GITHUB_RUN_NUMBER"
           fi
+          BR_UAT="$BASE-uat"; BR_PROD="$BASE-prod"
 
           # same engine as the release trains — a hotfix IS a tiny train,
-          # just cut from production instead of the next env down the lane
-          PICKS_OUT=picks.tsv scripts/cut-train.sh production "$BRANCH" "$PRS"
-          git push -q origin "$BRANCH"
-          echo "BRANCH=$BRANCH" >>"$GITHUB_ENV"
+          # just cut from production instead of the next env down the lane.
+          # Build the picks once, on the uat twin's branch:
+          PICKS_OUT=picks.tsv scripts/cut-train.sh production "$BR_UAT" "$PRS"
+
+          # Sibling branch for the production twin: SAME content, DISTINCT
+          # tip SHA (required checks are SHA-keyed — see header). A trailer
+          # amend re-tips it; the cherry-pick stamp in the body is preserved,
+          # so the gate's provenance rules still see the same origins.
+          git switch -q -c "$BR_PROD"
+          git commit -q --amend --no-edit --trailer "Hotfix-Lane: production"
+
+          git push -q origin "$BR_UAT" "$BR_PROD"
+          echo "BR_UAT=$BR_UAT"   >>"$GITHUB_ENV"
+          echo "BR_PROD=$BR_PROD" >>"$GITHUB_ENV"
 
       - name: open the twin PRs
         run: |
           set -euo pipefail
           # if PR creation is blocked (Actions PR-creation setting off, no
-          # LAB_BOT_PAT), the branch is already pushed — say so and stop
-          trap '{ echo "## twins NOT (fully) created — branch \`$BRANCH\` is pushed with the picks aboard.";
-                  echo "Open them by hand (\`gh pr create --base uat|production --head $BRANCH\`) or fix the";
-                  echo "Actions PR-creation setting / add \`LAB_BOT_PAT\` and re-dispatch (see promote.yaml header)."; } >>"$GITHUB_STEP_SUMMARY"' ERR
+          # LAB_BOT_PAT), the branches are already pushed — say so and stop
+          trap '{ echo "## twins NOT (fully) created — branches \`$BR_UAT\` / \`$BR_PROD\` are pushed with the picks aboard.";
+                  echo "Open them by hand (\`gh pr create --base uat --head $BR_UAT\` / \`--base production --head $BR_PROD\`)";
+                  echo "or fix the Actions PR-creation setting / add \`LAB_BOT_PAT\` and re-dispatch (see promote.yaml header)."; } >>"$GITHUB_STEP_SUMMARY"' ERR
           FIRST_TITLE="$(head -1 picks.tsv | cut -f2)"
           NPICKS="$(wc -l <picks.tsv | tr -d ' ')"
           SUFFIX=""; [ "$NPICKS" -gt 1 ] && SUFFIX=" (+$((NPICKS-1)) more)"
@@ -94,16 +115,20 @@ jobs:
           # twin 1: uat — the yellow train. Merge this one first.
           { cat body-common.md
             echo "**This is the uat twin — merge it FIRST.** Its production sibling stays red at the gate until these picks are on uat."
+            echo ""
+            echo "_Twins live on separate identical-content branches so each carries its own gate verdict (required checks are SHA-keyed)._"
           } >body-uat.md
-          U1=$(gh pr create --base uat --head "$BRANCH" \
+          U1=$(gh pr create --base uat --head "$BR_UAT" \
                  --title "hotfix: $FIRST_TITLE$SUFFIX" \
                  --body-file body-uat.md)
 
           # twin 2: production — gated on the uat twin having merged.
           { cat body-common.md
-            echo "**This is the production twin.** The gate holds it red until every pick's origin is on uat (merge the uat twin, then re-run/wait for the gate here)."
+            echo "**This is the production twin.** The gate holds it red until every pick's origin is on uat (merge the uat twin, then re-run the gate here)."
+            echo ""
+            echo "_Twins live on separate identical-content branches so each carries its own gate verdict (required checks are SHA-keyed)._"
           } >body-prod.md
-          U2=$(gh pr create --base production --head "$BRANCH" \
+          U2=$(gh pr create --base production --head "$BR_PROD" \
                  --title "[merge after uat] hotfix: $FIRST_TITLE$SUFFIX" \
                  --body-file body-prod.md)
 
