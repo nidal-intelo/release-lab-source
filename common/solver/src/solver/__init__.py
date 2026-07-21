@@ -1,7 +1,7 @@
 """solver -- stand-in for the solver package."""
 
 ERA = "2.0-era"
-STRATEGY = "greedy"
+STRATEGY = "greedy + jitter"
 
 
 def describe() -> str:
