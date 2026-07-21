@@ -14,7 +14,7 @@ is six small pieces around that single idea:
 | deploy | `.github/workflows/deploy.yaml` | deploy on env-branch push; rc-/rel- tags; release notes; Slack preview | the `v1-*` deployment workflows + notify-slack |
 | promote | `.github/workflows/promote.yaml` | the release button: wholesale PR (Mode A) or cherry-picked train (Mode B — dev→uat only) | dispatch side of `v1-promotion-gate.yaml` |
 | gate | `.github/workflows/gate.yaml` | the one required check: lanes, stamps, uat-first | `v1-promotion-gate.yaml` |
-| hotfix | `.github/workflows/hotfix.yaml` | stamped fix off production's tip, twin PRs | `v1-hotfix-create.yaml` |
+| hotfix | `.github/workflows/hotfix.yaml` | stamped fix off production's tip; twin PRs on twin branches (SHA-keyed checks) | `v1-hotfix-create.yaml` |
 | stranded-pr | `.github/workflows/stranded-pr.yaml` | the nagging issue: merged to dev ≠ released | the visibility / notify layer |
 | protection | `scripts/setup-protection.sh` | rulesets: PR-only + required gate on uat/production | branch protection config |
 
@@ -323,9 +323,19 @@ git switch dev && git pull
 
 ```sh
 gh workflow run hotfix.yaml -f prs=<fix-pr>
-gh run watch                     # cuts hotfix/pr-<n> from PRODUCTION's tip; twin PRs open
-gh pr list                       # "hotfix: …" → uat   and   "[merge after uat] hotfix: …" → production
+gh run watch          # cuts hotfix/pr-<n>-uat AND hotfix/pr-<n>-prod from PRODUCTION's
+                      # tip — identical content, two branches — and opens the twins
+gh pr list            # "hotfix: …" → uat   and   "[merge after uat] hotfix: …" → production
 ```
+
+> **Why two branches?** Branch-protection required checks are keyed by
+> **(commit SHA, check name)**. Twins sharing one head commit share one
+> `gate` slot — the production twin's *correctly* red verdict would also
+> block the *legitimately green* uat twin (the first learner run hit exactly
+> this: #30/#31, reissued as #32/#33). Separate identical-content branches
+> give each twin its own SHA, so each holds its own verdict. This is a
+> real-repo requirement too: the actual `v1-hotfix-create.yaml` must open
+> its twins on separate branches for the same reason.
 
 **Step 3 — try to merge production FIRST:**
 
@@ -337,10 +347,9 @@ gh pr merge <prod-twin> --merge  # refused: required check is red
 **Step 4 — the right order:**
 
 ```sh
-gh pr merge <uat-twin> --merge          # gate was green there; uat deploys, rc-tag
-# twins share ONE head commit, so the commit's check list shows the LATEST
-# gate run — if the prod twin still shows the old red, re-run it:
-gh pr checks <prod-twin>                # re-run via the web UI or: gh run rerun <gate-run-id>
+gh pr merge <uat-twin> --merge          # its own gate is green; uat deploys, rc-tag
+# the prod twin's gate verdict predates the uat merge — re-run it to re-judge:
+gh run rerun <prod-gate-run-id>         # or "Re-run" in the web UI
 gh pr merge <prod-twin> --merge         # now green: picks are on uat
 gh run watch                            # production deploy
 git fetch --tags -f && git tag -l 'rel-*'   # rel-YYYY.MM.DD-hf1
