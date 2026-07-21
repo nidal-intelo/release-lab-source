@@ -71,7 +71,11 @@ while IFS=$'\t' read -r -u 3 MERGED_AT NUM TITLE AUTHOR SHA; do
     REQUESTED="$(cut -f2 "$RESOLVED")"
     LIKELY=""
     for S in $(sort -un "$SUSPECTS"); do
-      if ! grep -qx "$S" <<<"$REQUESTED"; then LIKELY="$LIKELY #$S"; fi
+      if grep -qx "$S" <<<"$REQUESTED"; then continue; fi
+      # only dev PRs count as dependencies — a commit is also "associated"
+      # with the promotion PR that later carried it to uat, which is noise
+      if [ -z "$(gh pr view "$S" --json baseRefName --jq 'select(.baseRefName=="dev") | .number' 2>/dev/null)" ]; then continue; fi
+      LIKELY="$LIKELY #$S"
     done
     rm -f "$SUSPECTS"
 
