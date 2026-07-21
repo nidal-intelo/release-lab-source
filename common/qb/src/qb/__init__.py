@@ -3,7 +3,7 @@
 ERA = "1.5-era"
 ROUNDING = "rounds HALF-EVEN (banker's rounding) + audit log [epsilon 1e-9] + something"
 
-CART_NOTE = "empty carts handled correctly"
+CART_NOTE = "empty carts handled correctly hotfix"
 
 
 def describe() -> str:
