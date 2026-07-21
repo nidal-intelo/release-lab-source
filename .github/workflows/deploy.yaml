@@ -219,3 +219,19 @@ jobs:
           if [ -n "${PR_NUM:-}" ]; then
             gh pr comment "$PR_NUM" --body-file slack.md || true
           fi
+
+      # The other half of stranded-pr.yaml's audit, printed exactly where a
+      # releaser is already looking: what did this uat release NOT carry?
+      - name: footer — what is still waiting on dev (uat only)
+        if: github.ref_name == 'uat'
+        run: |
+          set -euo pipefail
+          scripts/pending.sh 0 >pending.tsv || true
+          {
+            echo ""
+            if [ -s pending.tsv ]; then
+              echo "**NOT on uat yet:** $(cut -f1 pending.tsv | sed 's/^/#/' | paste -sd' ' -) — merged to dev, still waiting for a train."
+            else
+              echo "**NOT on uat yet:** nothing — dev is fully released. :broom:"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
