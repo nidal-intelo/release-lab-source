@@ -1,0 +1,132 @@
+# gate — the one required check on every PR into uat or production.
+#
+# PROTOTYPES (real repo): v1-promotion-gate.yaml.
+#
+# Three rules, in order:
+#
+#   1. ALLOWED LANES. uat and production accept PRs only from:
+#        dev        -> uat          (Mode A wholesale)
+#        uat        -> production   (Mode A wholesale)
+#        train/*                    (Mode B release trains)
+#        hotfix/*                   (hotfix twins)
+#        bot/*                      (reserved for automation)
+#      Anything else — e.g. a feature branch aimed straight at production —
+#      is refused: work lands on dev, releases ride the lanes.
+#
+#   2. STAMPS (train/* and hotfix/* heads only). Every added non-merge commit
+#      must carry a "(cherry picked from commit <sha>)" stamp whose origin is
+#      reachable from dev. A hand-edited commit smuggled onto a train has no
+#      stamp -> named and refused. Provenance or it didn't happen.
+#
+#   3. YELLOW TRAIN FIRST (train/hotfix PRs into production only). Every
+#      pick's ORIGIN must already be on uat — either merged wholesale
+#      (reachable) or cherry-picked there (a uat commit carries its stamp).
+#      This is what makes hotfix twin-PR ordering mechanical: the production
+#      twin is simply red until the uat twin merges.
+#
+# The branch rulesets (scripts/setup-protection.sh) REQUIRE this check by its
+# job name, "gate" — that is what turns a red gate into "cannot merge".
+name: gate
+
+on:
+  pull_request:
+    branches: [uat, production]
+
+permissions:
+  contents: read
+  pull-requests: write       # explain failures on the PR itself
+
+concurrency:
+  group: gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:                      # <- check name "gate"; rulesets point at it
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: run the three rules
+        run: |
+          set -euo pipefail
+          BASE="${{ github.base_ref }}"
+          HEAD_REF="${{ github.head_ref }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          git fetch -q origin dev uat production
+
+          FAILS=""
+          fail() { FAILS="${FAILS}- $1"$'\n'; }
+
+          # ---- rule 1: allowed lanes -----------------------------------
+          MODE=""
+          if   [ "$BASE" = uat ]        && [ "$HEAD_REF" = dev ]; then MODE=wholesale
+          elif [ "$BASE" = production ] && [ "$HEAD_REF" = uat ]; then MODE=wholesale
+          elif [[ "$HEAD_REF" == train/* || "$HEAD_REF" == hotfix/* ]]; then MODE=train
+          elif [[ "$HEAD_REF" == bot/* ]]; then MODE=bot
+          else
+            fail "\`$HEAD_REF\` → \`$BASE\` is not a release lane. Work lands on **dev** (open PRs there); releases reach \`$BASE\` only as \`dev→uat\`, \`uat→production\`, \`train/*\`, \`hotfix/*\`, or \`bot/*\`."
+          fi
+
+          # ---- rules 2 + 3: stamp provenance ---------------------------
+          CHECKED=0
+          if [ "$MODE" = train ]; then
+            for C in $(git rev-list --no-merges "origin/$BASE..$HEAD_SHA"); do
+              CHECKED=$((CHECKED+1))
+              SUBJ="$(git show -s --format=%s "$C")"
+              ORIGIN="$(git show -s --format=%B "$C" \
+                        | { grep -oE '\(cherry picked from commit [0-9a-f]{40}\)' || true; } \
+                        | tail -1 | { grep -oE '[0-9a-f]{40}' || true; })"
+              if [ -z "$ORIGIN" ]; then
+                fail "**UNSTAMPED** commit \`${C:0:7}\` (“${SUBJ}”): every commit on a train/hotfix branch must be a \`git cherry-pick -x\` of a dev commit. Hand edits don't ride trains."
+                continue
+              fi
+              if ! git merge-base --is-ancestor "$ORIGIN" origin/dev; then
+                fail "commit \`${C:0:7}\`: stamp points at \`${ORIGIN:0:7}\`, which is **not on dev** — picks must originate from work that landed on dev."
+                continue
+              fi
+              if [ "$BASE" = production ]; then
+                ON_UAT=no
+                if git merge-base --is-ancestor "$ORIGIN" origin/uat; then ON_UAT=yes; fi
+                if [ "$ON_UAT" = no ] && [ -n "$(git log origin/uat --grep="cherry picked from commit $ORIGIN" --format=%H -n 1)" ]; then ON_UAT=yes; fi
+                if [ "$ON_UAT" = no ]; then
+                  fail "commit \`${C:0:7}\` (origin \`${ORIGIN:0:7}\`) has **not ridden uat** — merge the uat twin/train first. Yellow train before red."
+                fi
+              fi
+            done
+          fi
+
+          # ---- verdict --------------------------------------------------
+          {
+            echo "## gate: \`$HEAD_REF\` → \`$BASE\`"
+            echo ""
+            case "$MODE" in
+              wholesale) echo "lane: **wholesale promotion** — nothing to stamp-check; the diff is the branch delta." ;;
+              train)     echo "lane: **train/hotfix** — checked $CHECKED added commit(s) for stamps$( [ "$BASE" = production ] && echo ' + uat ridership')." ;;
+              bot)       echo "lane: **bot** — reserved lane, no stamp rules." ;;
+              *)         echo "lane: **refused**." ;;
+            esac
+            echo ""
+            if [ -z "$FAILS" ]; then
+              echo "**PASS** ✅"
+            else
+              echo "**FAIL** ❌"
+              echo ""
+              echo "$FAILS"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$FAILS" ]; then
+            # say it where the merger is looking, not just in the run log
+            {
+              echo "### gate: FAIL ❌"
+              echo ""
+              echo "$FAILS"
+              echo "_Fix the branch (or re-cut the train) and push; the gate re-runs on every update._"
+            } >comment.md
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md || true
+            exit 1
+          fi
