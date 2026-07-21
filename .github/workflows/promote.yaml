@@ -1,0 +1,144 @@
+# promote — the release button. Dispatch it with a target and (optionally) a
+# list of dev PR numbers:
+#
+#   MODE A (prs empty): WHOLESALE — open a promotion PR merging the whole
+#     source branch (dev->uat, or uat->production). Everything goes.
+#
+#   MODE B (prs given): RELEASE TRAIN — cherry-pick exactly those PRs' merge
+#     commits (stamped, in dev-merge order) onto a train/<target>-<date>
+#     branch cut from the TARGET's current tip, and open a train PR whose
+#     body ECHOES BACK precisely what boarded. Merging the PR is the release.
+#
+# PROTOTYPES (real repo): the dispatch side of v1-promotion-gate.yaml.
+#
+# Note on Mode B to production: picks still come from dev (that is where work
+# lands), but the gate will refuse any pick that has not already ridden a uat
+# release — "yellow train first". promote does not pre-check that; the gate
+# owns that rule in exactly one place.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: environment to release to
+        type: choice
+        options: [uat, production]
+        required: true
+      prs:
+        description: "dev PR numbers, comma-separated (empty = wholesale promotion)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write            # push the train branch
+  pull-requests: write       # open the promotion / train PR
+
+env:
+  # THE TOKEN TEACHABLE. PRs created with the default github.token DO NOT
+  # TRIGGER pull_request workflows (GitHub suppresses events from Actions'
+  # own token to prevent loops). So a token-created promotion PR shows NO
+  # checks — and once the gate is a *required* check, no checks means
+  # UNMERGEABLE. The fix is a real identity: a fine-grained PAT stored as
+  # LAB_BOT_PAT (you mint it in exercise 3.4). Until then we fall back to
+  # github.token so you can watch the failure happen.
+  GH_TOKEN: ${{ secrets.LAB_BOT_PAT || github.token }}
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # trains cherry-pick across branch history
+
+      - name: git identity (the train's cherry-picks need a committer)
+        run: |
+          git config user.name "Release Lab"
+          git config user.email "lab@local"
+
+      - name: "mode A: wholesale promotion PR"
+        if: inputs.prs == ''
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.target }}"
+          # the lane below the target: dev feeds uat, uat feeds production
+          SOURCE=$([ "$TARGET" = uat ] && echo dev || echo uat)
+
+          BODY="Wholesale promotion: merging this PR makes \`$TARGET\` identical to \`$SOURCE\` (source-world: the branch IS the deploy).
+
+The **gate** check validates the lane; **deploy** runs on merge and posts the Slack preview here."
+
+          if URL=$(gh pr create --base "$TARGET" --head "$SOURCE" \
+                     --title "promote: $SOURCE → $TARGET (wholesale)" \
+                     --body "$BODY" 2>&1); then
+            echo "opened: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # Two known ways this fails — both are lessons, not mysteries:
+            {
+              echo "## promotion PR NOT created"
+              echo '```'
+              echo "$URL"
+              echo '```'
+              echo "* **\"GitHub Actions is not permitted to create or approve pull requests\"** — the repo setting"
+              echo "  *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests* is off."
+              echo "  That's the coarse gate. Enable it (or add a \`LAB_BOT_PAT\` secret, which bypasses it entirely)."
+              echo "* **\"a pull request already exists\"** — there's already an open promotion PR for this lane; merge or close it."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: "mode B: cut a stamped release train"
+        if: inputs.prs != ''
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.target }}"
+          PRS="${{ inputs.prs }}"
+
+          BRANCH="train/$TARGET-$(date +%Y-%m-%d)"
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            BRANCH="$BRANCH-$GITHUB_RUN_NUMBER"   # second train today: suffix it
+          fi
+
+          # resolve -> order -> cut from target tip -> stamped picks
+          # (fails loudly with the dependency detector's verdict on conflict)
+          PICKS_OUT=picks.tsv scripts/cut-train.sh "$TARGET" "$BRANCH" "$PRS"
+
+          git push -q origin "$BRANCH"
+
+          # ECHO-BACK: the PR body states exactly what boarded. If this table
+          # is not what you meant to release, close the PR — merging it IS the
+          # release.
+          {
+            echo "## Train to \`$TARGET\` — echo-back"
+            echo ""
+            echo "Cut from \`$TARGET\` @ \`$(git rev-parse --short "origin/$TARGET")\`. Picks in dev-merge order:"
+            echo ""
+            echo "| PR | title | author | picked merge SHA |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r NUM TITLE AUTHOR SHA; do
+              echo "| #$NUM | $TITLE | $AUTHOR | \`${SHA:0:7}\` |"
+            done <picks.tsv
+            echo ""
+            echo "Every commit on this branch carries a \`(cherry picked from commit …)\` stamp; the **gate** check verifies each one. Merging this PR releases exactly the rows above — nothing else."
+          } >body.md
+
+          PRLIST="$(cut -f1 picks.tsv | sed 's/^/#/' | paste -sd, -)"
+          if URL=$(gh pr create --base "$TARGET" --head "$BRANCH" \
+                     --title "train: $TARGET $(date +%Y-%m-%d) ($PRLIST)" \
+                     --body-file body.md 2>&1); then
+            echo "opened: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
+            cat body.md >>"$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## train branch pushed, but PR NOT created"
+              echo '```'
+              echo "$URL"
+              echo '```'
+              echo "Branch \`$BRANCH\` exists with the picks aboard — open the PR by hand"
+              echo "(\`gh pr create --base $TARGET --head $BRANCH\`) or fix the Actions"
+              echo "PR-creation setting / add \`LAB_BOT_PAT\` and re-dispatch."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
