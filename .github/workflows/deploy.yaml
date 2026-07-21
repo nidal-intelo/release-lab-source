@@ -1,0 +1,221 @@
+# deploy — source-world deploy on env-branch push: change detection, release
+# tags, release notes, and a simulated Slack post.
+#
+# PROTOTYPES (real repo): the v1-* deployment workflows (v1-report-builder,
+# v1-web-gateway, ...) plus the notify-slack step they all share.
+#
+# THE SOURCE-WORLD DIFFERENCE — read this next to pinned-world's deploy.yaml:
+# there, a consumer redeploys ONLY if consumers/<name>/ changed; common/ is
+# deliberately NOT watched, because "what runs" is decided by pins, and a
+# common/ change without a pin change is (supposedly) inert. That deliberate
+# blind spot is the pinned world's signature failure mode.
+# Here there are no pins. The branch IS the truth, so a consumer redeploys if
+# ANY of these changed since the last deploy:
+#
+#       consumers/<name>/    its own code
+#       common/              ANY shared source        <- the pinned world's
+#       uv.lock              the workspace lock          blind spot, watched
+#       pyproject.toml       the workspace definition
+#
+# Bookkeeping this workflow does on top of deploying:
+#   * floating tag  lab-<branch>-latest  = last deployed commit (change detection)
+#   * permanent tags on uat  = rc-YYYY.MM.DD-n      (release candidates)
+#     and on production      = rel-YYYY.MM.DD-n     (releases)
+#                              rel-YYYY.MM.DD-hfN   (when a hotfix/* branch merged)
+#   * production release notes: PR titles since the previous rel-* tag
+#   * a rendered #release-updates Slack message (step summary + PR comment).
+#     In the real repo this posts through a Slack webhook (SLACK_WEBHOOK
+#     secret) and a github-login -> slack-member-id map; the lab has no Slack,
+#     so we render the exact message and pin it to the promotion PR instead.
+name: deploy
+
+on:
+  push:
+    branches: [dev, uat, production]
+
+permissions:
+  contents: write            # move/plant tags
+  pull-requests: write       # pin the Slack preview to the just-merged PR
+
+# One deploy per environment at a time (parallel runs would race the tags).
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # fetch-depth 0: change detection, tag math, and release notes all need
+      # full history + all tags.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.x"
+
+      - name: detect changes + deploy
+        run: |
+          set -euo pipefail
+          ENV="$GITHUB_REF_NAME"
+          TAG="lab-$ENV-latest"
+
+          # Where was this environment the last time we deployed it?
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            PREV="$(git rev-parse "$TAG")"
+            CHANGED="$(git diff --name-only "$PREV"..HEAD)"
+            echo "last deploy of '$ENV' was ${PREV:0:7}"
+          else
+            PREV=""            # first deploy: everything counts as changed
+            CHANGED="$(git ls-files)"
+            echo "first deploy of '$ENV' (no $TAG tag yet)"
+          fi
+          echo "PREV=$PREV" >>"$GITHUB_ENV"
+
+          {
+            echo "## deploy: \`$ENV\` @ \`$(git rev-parse --short HEAD)\`"
+            echo ""
+            echo "| consumer | redeploy? | why | behavior now running |"
+            echo "|---|---|---|---|"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          for C in report worker; do
+            WHY=""
+            if [ -z "$PREV" ]; then
+              WHY="first deploy"
+            else
+              # THE WATCH LIST — contrast with pinned world, which watches
+              # only consumers/<name>/ and calls the rest "someone else's pin".
+              if grep -qE "^consumers/$C/" <<<"$CHANGED"; then WHY="consumers/$C/ changed"; fi
+              if grep -qE "^common/"       <<<"$CHANGED"; then WHY="${WHY:+$WHY + }common/ changed"; fi
+              if grep -qE "^(uv\.lock|pyproject\.toml)$" <<<"$CHANGED"; then WHY="${WHY:+$WHY + }workspace changed"; fi
+            fi
+            # "Deploy" in the source world = sync + run from the checked-out
+            # tree (exactly what ./deploy.sh does). We run the consumer either
+            # way so the summary always states what this env actually runs;
+            # a "skipped" row is a no-op redeploy, not a mystery.
+            uv sync -q --package "$C"
+            OUT="$(.venv/bin/python -c "import $C; print($C.main())")"
+            if [ -n "$WHY" ]; then
+              echo "| $C | **redeployed** | $WHY | \`$OUT\` |" >>"$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $C | skipped (no-op) | nothing it runs changed | \`$OUT\` |" >>"$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: move the floating tag
+        run: |
+          set -euo pipefail
+          TAG="lab-$GITHUB_REF_NAME-latest"
+          # Floating tags move; permanent rc-/rel- tags (next step) never do.
+          # Delete + recreate instead of force-pushing.
+          git push -q origin ":refs/tags/$TAG" 2>/dev/null || true
+          git tag -f "$TAG" >/dev/null
+          git push -q origin "refs/tags/$TAG"
+
+      # ---- everything below only matters for uat / production pushes ----
+
+      - name: plant the permanent release tag (uat/production)
+        if: github.ref_name == 'uat' || github.ref_name == 'production'
+        run: |
+          set -euo pipefail
+          ENV="$GITHUB_REF_NAME"
+          # date from the commit timestamp, not wall clock: re-runs stay stable
+          DATE="$(git log -1 --format=%cd --date=format:%Y.%m.%d)"
+
+          # Which PR did this push merge (if any)? Needed twice: hotfix
+          # detection here, and the Slack comment target later.
+          PRJ="$(gh api "repos/{owner}/{repo}/commits/$GITHUB_SHA/pulls" 2>/dev/null || echo '[]')"
+          PR_NUM="$(jq -r --arg s "$GITHUB_SHA" '[.[]|select(.merge_commit_sha==$s)][0].number // empty' <<<"$PRJ")"
+          PR_HEAD="$(jq -r --arg s "$GITHUB_SHA" '[.[]|select(.merge_commit_sha==$s)][0].head.ref // empty' <<<"$PRJ")"
+          echo "PR_NUM=$PR_NUM" >>"$GITHUB_ENV"
+
+          if [ "$ENV" = uat ]; then
+            N=$(( $(git tag -l "rc-$DATE-*" | wc -l) + 1 ))
+            REL="rc-$DATE-$N"
+          elif [[ "$PR_HEAD" == hotfix/* ]]; then
+            # hotfixes get their own counter: rel-YYYY.MM.DD-hfN
+            N=$(( $(git tag -l "rel-$DATE-hf*" | wc -l) + 1 ))
+            REL="rel-$DATE-hf$N"
+          else
+            N=$(( $(git tag -l "rel-$DATE-*" | { grep -cv -- '-hf' || true; }) + 1 ))
+            REL="rel-$DATE-$N"
+          fi
+          git tag "$REL"
+          git push -q origin "refs/tags/$REL"
+          echo "REL=$REL" >>"$GITHUB_ENV"
+          echo "" >>"$GITHUB_STEP_SUMMARY"
+          echo "**tagged: \`$REL\`**" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: compose the Slack message (uat/production)
+        if: github.ref_name == 'uat' || github.ref_name == 'production'
+        run: |
+          set -euo pipefail
+          ENV="$GITHUB_REF_NAME"
+
+          # Boarded cargo = dev PRs that landed in this deploy's commit range
+          # (wholesale merges by subject, train/hotfix picks by their stamp).
+          FROM="$PREV"
+          if [ -z "$FROM" ] && git rev-parse -q --verify "lab-start-$ENV" >/dev/null; then
+            FROM="lab-start-$ENV"
+          fi
+          scripts/boarded.sh "$FROM" HEAD >boarded.tsv
+
+          {
+            if [ "$ENV" = uat ]; then
+              echo ":vertical_traffic_light: **Released to UAT as \`$REL\`** (\`uat\` @ \`$(git rev-parse --short HEAD)\`)"
+            else
+              echo ":rocket: **Released to PROD as \`$REL\`** (\`production\` @ \`$(git rev-parse --short HEAD)\`)"
+            fi
+            echo ""
+            if [ -s boarded.tsv ]; then
+              echo "| PR | title | author | ping |"
+              echo "|---|---|---|---|"
+              # <@login> is a PLACEHOLDER: the real notify-slack resolves the
+              # github login to a Slack member id via a small mapping file.
+              while IFS=$'\t' read -r NUM TITLE AUTHOR MERGED; do
+                echo "| #$NUM | $TITLE | $AUTHOR | <@$AUTHOR> |"
+              done <boarded.tsv
+            else
+              echo "_no PR-tracked cargo in this deploy (direct push or CI seeding)_"
+            fi
+            echo ""
+            if [ "$ENV" = uat ]; then
+              echo "Your change is **on UAT now** — test yours and nominate it for PROD if good."
+            else
+              echo "Shipped. :ship:"
+              # Release notes: everything since the previous rel-* tag.
+              # --merged HEAD: only consider tags actually in this branch's
+              # history (a stray rel-* tag on an orphaned commit can't confuse us).
+              PREV_REL="$(git tag -l 'rel-*' --merged HEAD --sort=-creatordate | { grep -vx "$REL" || true; } | head -1)"
+              [ -z "$PREV_REL" ] && PREV_REL="lab-start-production"
+              echo ""
+              echo "**Release notes** (\`$PREV_REL\` → \`$REL\`):"
+              scripts/boarded.sh "$PREV_REL" HEAD >notes.tsv
+              if [ -s notes.tsv ]; then
+                while IFS=$'\t' read -r NUM TITLE AUTHOR MERGED; do
+                  echo "- #$NUM — $TITLE (@$AUTHOR)"
+                done <notes.tsv
+              else
+                echo "- _(no PR-tracked changes)_"
+              fi
+            fi
+          } >slack.md
+
+          {
+            echo ""
+            echo "---"
+            echo "## SLACK PREVIEW (#release-updates)"
+            echo ""
+            cat slack.md
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # Pin the same message to the promotion/train/hotfix PR that caused
+          # this deploy, when there is one. (Real repo: Slack webhook instead.)
+          if [ -n "${PR_NUM:-}" ]; then
+            gh pr comment "$PR_NUM" --body-file slack.md || true
+          fi
