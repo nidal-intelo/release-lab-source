@@ -1,6 +1,6 @@
 """qb -- stand-in for query-builder."""
 
-ERA = "1.5-era"
+ERA = "1.5-era (empty-cart hotfix)"
 ROUNDING = (
     "rounds HALF-EVEN (banker's rounding) + audit log [epsilon 1e-9] + something LIVE"
 )
